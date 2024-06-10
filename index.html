@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>プリンターへ送信</title>
+<style>
+.status {
+    margin-top: 20px;
+}
+.success {
+    color: green;
+}
+.error {
+    color: red;
+}
+.info {
+    color: blue;
+}
+</style>
+</head>
+<body>
+    <h1>プリンターへ送信</h1>
+    <form id="upload-form">
+        <label for="token-file">トークンファイルを選択 (txt): </label>
+        <input type="file" id="token-file" accept=".txt"><br><br>
+        <div id="token-info" class="info" style="display: none;">過去の送信トークンが保存されています</div><br>
+        <label for="file-to-upload">アップロードファイルを選択: </label>
+        <input type="file" id="file-to-upload"><br><br>
+        <label for="numberSelect">部数を選択: </label>
+        <select id="numberSelect">
+            <script>
+              for (let i = 1; i <= 10; i++) { document.write(`<option value="${i}">${i}</option>`); }
+            </script>
+          </select>
+        <button type="button" id="send-button" onclick="sendFiles()">Send</button>
+    </form>
+    <div id="status" class="status"></div>
+<script>
+function numCheck() {
+    var selectedNumber = document.getElementById("numberSelect").value;
+    if (isNaN(selectedNumber) || selectedNumber === "" || selectedNumber < 1 || selectedNumber > 10) {
+        window.alert("部数は数字を選んでください");
+        return 0;
+    } else {
+        return selectedNumber;
+    }
+};
+document.addEventListener("DOMContentLoaded", () => {
+    const refreshToken = localStorage.getItem('refreshToken');
+    const appKey = localStorage.getItem('appKey');
+    const appSecret = localStorage.getItem('appSecret');
+    const discordWebhookUrl = localStorage.getItem('discordWebhookUrl');
+    const tokenInfoDiv = document.getElementById('token-info');
+    
+    if (refreshToken && appKey && appSecret && discordWebhookUrl) {
+        tokenInfoDiv.style.display = 'block';
+    }
+});
+
+async function sendFiles() {
+    var num = numCheck();
+    if (num == 0) { return; }
+    const tokenFileInput = document.getElementById('token-file');
+    const fileToUploadInput = document.getElementById('file-to-upload');
+    const statusDiv = document.getElementById('status');
+    const sendButton = document.getElementById('send-button');
+    
+    statusDiv.textContent = '';
+    statusDiv.classList.remove('success', 'error');
+    sendButton.disabled = true;
+
+    const tokenFile = tokenFileInput.files[0];
+    const fileToUpload = fileToUploadInput.files[0];
+
+    if (!fileToUpload) {
+        alert('ファイルを選択してください');
+        sendButton.disabled = false;
+        return;
+    }
+
+    let refreshToken, appKey, appSecret, discordWebhookUrl;
+
+    if (tokenFile) {
+        const reader = new FileReader();
+        reader.onload = async function(event) {
+            const lines = event.target.result.trim().split('\n');
+            if (lines.length < 4) {
+                alert('トークンファイルの形式が正しくありません');
+                sendButton.disabled = false;
+                return;
+            }
+
+            refreshToken = lines[0].trim();
+            appKey = lines[1].trim();
+            appSecret = lines[2].trim();
+            discordWebhookUrl = lines[3].trim();
+
+            localStorage.setItem('refreshToken', refreshToken);
+            localStorage.setItem('appKey', appKey);
+            localStorage.setItem('appSecret', appSecret);
+            localStorage.setItem('discordWebhookUrl', discordWebhookUrl);
+
+            await processFiles(refreshToken, appKey, appSecret, discordWebhookUrl, fileToUpload, statusDiv, sendButton, num);
+        };
+        reader.readAsText(tokenFile);
+    } else {
+        refreshToken = localStorage.getItem('refreshToken');
+        appKey = localStorage.getItem('appKey');
+        appSecret = localStorage.getItem('appSecret');
+        discordWebhookUrl = localStorage.getItem('discordWebhookUrl');
+
+        if (!refreshToken || !appKey || !appSecret || !discordWebhookUrl) {
+            alert('トークンファイルを選択してください');
+            sendButton.disabled = false;
+            return;
+        }
+
+        await processFiles(refreshToken, appKey, appSecret, discordWebhookUrl, fileToUpload, statusDiv, sendButton, num);
+    }
+}
+
+async function processFiles(refreshToken, appKey, appSecret, discordWebhookUrl, fileToUpload, statusDiv, sendButton, num) {
+    const fileExtension = fileToUpload.name.split('.').pop();
+    const renamedFile = new File([fileToUpload], `target.${fileExtension}`, { type: fileToUpload.type });
+
+    try {
+        const accessToken = await getDropboxAccessToken(refreshToken, appKey, appSecret);
+        await deleteExistingTargetFiles(accessToken);
+        await uploadToDropbox(accessToken, renamedFile);
+        setTimeout(async () => {
+            await sendDiscordNotification(discordWebhookUrl, fileToUpload.name, num);
+            statusDiv.textContent = '送信に成功しました';
+            statusDiv.classList.add('success');
+            sendButton.disabled = false;
+        }, 3000);
+    } catch (error) {
+        statusDiv.textContent = `エラー: ${error.message}`;
+        statusDiv.classList.add('error');
+        sendButton.disabled = false;
+    }
+}
+
+async function getDropboxAccessToken(refreshToken, appKey, appSecret) {
+    const url = 'https://api.dropboxapi.com/oauth2/token';
+    const params = new URLSearchParams();
+    params.append('grant_type', 'refresh_token');
+    params.append('refresh_token', refreshToken);
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': 'Basic ' + btoa(appKey + ':' + appSecret),
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: params
+    });
+
+    if (!response.ok) {
+        throw new Error(`ドロップボックスのトークン更新に失敗しました: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.access_token;
+}
+
+async function deleteExistingTargetFiles(accessToken) {
+    const listFolderUrl = 'https://api.dropboxapi.com/2/files/list_folder';
+    const deleteFileUrl = 'https://api.dropboxapi.com/2/files/delete_v2';
+
+    const listResponse = await fetch(listFolderUrl, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            path: ''
+        })
+    });
+
+    if (!listResponse.ok) {
+        throw new Error(`フォルダのリストアップに失敗しました: ${listResponse.statusText}`);
+    }
+
+    const listData = await listResponse.json();
+    const targetFiles = listData.entries.filter(entry => entry.name.includes('target'));
+
+    for (const file of targetFiles) {
+        const deleteResponse = await fetch(deleteFileUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                path: file.path_lower
+            })
+        });
+
+        if (!deleteResponse.ok) {
+            throw new Error(`既存のtargetファイルの削除に失敗しました: ${deleteResponse.statusText}`);
+        }
+    }
+}
+
+async function uploadToDropbox(accessToken, file) {
+    const url = 'https://content.dropboxapi.com/2/files/upload';
+    const dropboxPath = `/${file.name}`;
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/octet-stream',
+            'Dropbox-API-Arg': JSON.stringify({
+                path: dropboxPath,
+                mode: 'add',
+                autorename: true,
+                mute: false,
+                strict_conflict: false
+            })
+        },
+        body: file
+    });
+
+    if (!response.ok) {
+        throw new Error(`ドロップボックスへのアップロードに失敗しました: ${response.statusText}`);
+    }
+}
+
+async function sendDiscordNotification(discordWebhookUrl, originalFileName, num) {
+
+    const response = await fetch(discordWebhookUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            //content: `success \`\`\`${originalFileName}\`\`\``
+            content: `dropbox_sended,num=${num}`
+        })
+    });
+    if (!response.ok) {
+        throw new Error(`Discord送信に失敗しました: ${response.statusText}`);
+    }
+}
+</script>
+</body>
+</html>
