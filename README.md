@@ -1,0 +1,2 @@
+github pagesが使いたいだけ
+tokenなんて書いてないよ
